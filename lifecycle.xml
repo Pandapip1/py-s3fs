@@ -1,0 +1,13 @@
+<LifecycleConfiguration>
+    <Rule>
+        <ID>old-version-expiration</ID>
+        <Filter>
+           <Prefix></Prefix>
+        </Filter>
+        <Status>Enabled</Status>
+        <NoncurrentVersionExpiration>
+            <NewerNoncurrentVersions>0</NewerNoncurrentVersions>
+            <NoncurrentDays>3</NoncurrentDays>
+        </NoncurrentVersionExpiration>
+    </Rule>
+</LifecycleConfiguration>
