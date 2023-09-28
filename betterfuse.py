@@ -7,7 +7,7 @@ from abc import abstractmethod
 
 fuse.fuse_python_api = (0, 2)
 if not hasattr(fuse, '__version__'):
-    raise RuntimeError('your fuse-py doesn\'t know of fuse.__version__, probably it\'s too old.')
+    raise RuntimeError('python-fuse doesn\'t have a __version__ attribute. It might be outdated.')
 
 def extract_docstring_after_class_attribute(klass, attribute_name):
     '''Extract the docstring associated with a class attribute using AST.'''
@@ -26,7 +26,7 @@ def extract_docstring_after_class_attribute(klass, attribute_name):
                             return next_node.value.value.strip()
     return None
 
-class FuseOption:
+class FuseOption(object):
     def __init__(self, default=None):
         self.default = default
         self.name = None
@@ -56,23 +56,7 @@ class FuseOption:
     def __set__(self, instance, value):
         setattr(instance.cmdline[0], self.name, value)
 
-class FuseMeta(type):
-    def __call__(cls, *args, **kwargs):
-        # Create the instance using the superclass's __call__ method
-        instance = super(FuseMeta, cls).__call__(*args, **kwargs)
-        
-        # If we don't have a mountpoint, don't preAttach
-        if instance.fuse_args.mountpoint is not None:
-            instance.preAttach()
-
-        # If we don't have a mountpoint and aren't helping or versioning, enable help and show usage
-        if instance.fuse_args.mountpoint is None and not instance.fuse_args.modifiers['showhelp'] and not instance.fuse_args.modifiers['showversion']:
-            instance.fuse_args.modifiers['showhelp'] = True
-            print(instance.parser.format_help())
-        
-        return instance
-
-class FuseApplication(fuse.Fuse, metaclass=FuseMeta):
+class FuseApplication(fuse.Fuse):
     '''
     A subclass of fuse.Fuse that uses the class's attributes to add options to the command line, and automatically parses it.
     '''
@@ -94,13 +78,15 @@ class FuseApplication(fuse.Fuse, metaclass=FuseMeta):
                     self.parser.add_option(f'--{name}', action='store_true', attr=attr.default, help=attr.docstring)
                 else:
                     self.parser.add_option(f'--{name}', action='store', type=attr.opt_type, default=attr.default, help=attr.docstring)
-        
-        # Parse the command line
-        self.parse(errex=1)
     
-    @abstractmethod
-    def preAttach(self):
-        '''
-        Called before the filesystem is attached.
-        '''
-        pass
+    def main(self, *args, **kwargs):
+        self.parse(errex=1)
+
+        if self.fuse_args.mountpoint is None and not self.fuse_args.modifiers['showhelp'] and not self.fuse_args.modifiers['showversion']:
+            self.fuse_args.modifiers['showhelp'] = True
+            print(self.parser.format_help())
+
+        self.premain()
+
+        # Call the superclass's main method
+        super().main(*args, **kwargs)

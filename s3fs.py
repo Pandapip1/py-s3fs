@@ -1,12 +1,45 @@
 from betterfuse import FuseApplication, FuseOption
-import os, stat, errno, inspect, datetime, boto3, botocore, configparser, fuse
+import os, stat, errno, inspect, datetime, boto3, botocore, configparser, fuse, io, types
+from mypy_boto3_s3.service_resource import S3ServiceResource, Bucket, Object, ObjectVersion
+from threading import Lock
+
+def _normpath(path):
+    '''
+    Normalize a path even more than os.path.normpath.
+    '''
+    # Ensure the path is absolute relative to the current directory as root
+    if not path.startswith('/'):
+        abs_path = '/' + path
+    else:
+        abs_path = path
+    
+    # Ensure it does not end in a slash
+    if abs_path.endswith('/') and abs_path != '/':
+        abs_path = abs_path[:-1]
+    
+    # Resolve . and ..
+    resolved_path = os.path.normpath(abs_path)
+    
+    # Return the processed path
+    return resolved_path
+
+def _relnormpath(path):
+    '''
+    Returns a relative normalized path, relative to the root directory.
+
+    (Basically _normpath but without the leading slash)
+    '''
+    normedpath = _normpath(path)
+    if normedpath == '/':
+        return '.'
+    return normedpath[1:]
 
 class S3Fs(FuseApplication):
     '''
     A filesystem that connects to an S3 account and exposes its buckets, objects, and configuration.
     '''
 
-    config_path: str = FuseOption(default='~/.aws/config')
+    config_file: str = FuseOption(default='~/.aws/config')
     '''
     The path to the AWS config file.
     '''
@@ -16,46 +49,387 @@ class S3Fs(FuseApplication):
     The path to the cache directory.
     '''
 
-    timestamp: int = datetime.datetime.now()
-    '''
-    The timestamp of when the filesystem was mounted, in seconds since the epoch.
-    '''
-
-    s3 = None
+    s3: S3ServiceResource = None
     '''
     The boto3 S3 resource.
     '''
 
-    buckets: dict = dict()
+    filesystem: dict[str, "S3Path"] = None
     '''
-    A map of bucket names to bucket objects.
-    '''
-
-    objects: dict = dict()
-    '''
-    A tree of object paths to object objects.
-
-    If an object is a directory, then the directory listing will override the object.
+    A dictionary of paths to S3Path objects.
     '''
 
-    versions: dict = dict()
-    '''
-    A dict of object paths to object versions.
-    '''
+    class S3Path(object):
+        '''
+        A helper class for representing S3 directories and files.
+        '''
 
-    offsets: dict = dict()
-    '''
-    A dict of object paths to sets of tuples of downloaded offsets.
-    '''
+        cache_dir: str = None
+        '''
+        The path to the cache directory.
+        '''
 
-    def preAttach(self):
+        s3: S3ServiceResource = None
+        '''
+        The boto3 S3 resource.
+        '''
+
+        bucket: Bucket = None
+        '''
+        The bucket that this path is in.
+        '''
+
+        path: str = None
+        '''
+        The path of the file or directory.
+        '''
+
+        isdir: bool = None
+        '''
+        Whether or not this path is a directory.
+        '''
+
+        obj: Object = None
+        '''
+        The object that this path represents, if it is a file.
+        '''
+
+        version: ObjectVersion = None
+        '''
+        The version of the object that this path represents, if it is a file.
+        '''
+
+        _lock: Lock = None
+        '''
+        A lock for this path.
+        '''
+
+        listing: set[str] = None
+        '''
+        A set of files and directories in this directory, if it is a directory.
+        '''
+
+        dirty: bool = None
+        '''
+        Whether or not this file is dirty (needs to be uploaded on flush), if it is a file.
+        '''
+
+        offsets: set[tuple[int]] = None
+        '''
+        A set of tuples of downloaded offsets, if it is a file.
+        '''
+
+        file: io.BufferedRandom = None
+        '''
+        The file object, if it is a file.
+        '''
+
+        fd: int = None
+        '''
+        The file descriptor, if it is a file.
+        '''
+        
+        @classmethod
+        def _add_offsets(cls, offsetspos1: set[tuple[int]], offsetspos2: set[tuple[int]]):
+            # Convert sets to lists, combine them, and sort based on the starting value of each tuple
+            combined = sorted(list(offsetspos1) + list(offsetspos2), key=lambda x: x[0])
+
+            result = []
+            stack = []
+
+            for current_range in combined:
+                if not stack:
+                    stack.append(current_range)
+                else:
+                    top = stack[-1]
+
+                    # If the current range overlaps or is contiguous with the top of the stack
+                    if current_range[0] <= top[1] + 1:
+                        # Merge the two ranges
+                        merged_range = (top[0], max(top[1], current_range[1]))
+                        stack.pop()
+                        stack.append(merged_range)
+                    else:
+                        # If they don't overlap or aren't contiguous, push the current range onto the stack
+                        stack.append(current_range)
+
+            # Add the merged ranges to the result
+            result.extend(stack)
+
+            return set(result)
+
+        @classmethod
+        def _subtract_offsets(cls, offsetspos: set[tuple[int]], offsetsneg: set[tuple[int]]):
+            # Convert sets to lists and sort them based on the starting value of each tuple
+            offsetspos = sorted(list(offsetspos), key=lambda x: x[0])
+            offsetsneg = sorted(list(offsetsneg), key=lambda x: x[0])
+
+            result = []
+            j = 0
+            for pos_range in offsetspos:
+                while j < len(offsetsneg) and offsetsneg[j][1] <= pos_range[0]:
+                    j += 1
+                temp_range = pos_range
+                while j < len(offsetsneg) and offsetsneg[j][0] < temp_range[1]:
+                    if offsetsneg[j][0] > temp_range[0]:
+                        result.append((temp_range[0], offsetsneg[j][0]))
+                    temp_range = (max(temp_range[0], offsetsneg[j][1]), temp_range[1])
+                    j += 1
+                if temp_range[0] < temp_range[1]:
+                    result.append(temp_range)
+
+            return set(result)
+
+        def __init__(self, s3, path, cache_dir, create=None):
+            '''
+            Initialize the path.
+            '''
+            # Ensure path is absolute and normalized
+            path = _normpath(path)
+
+            if path.lower().endswith('.s3fs'):
+                raise Exception('Cannot create files or directories ending in .s3fs; this is reserved for internal use')
+
+            # Set basic information
+            self.s3 = s3
+            self.path = path
+            self.cache_dir = cache_dir
+
+            if path == '/':
+                # Special case for root directory
+                if create is not None:
+                    raise Exception('Cannot create root directory')
+                self.isdir = True
+                self.listing = set()
+                self.bucket = None
+                # Now populate the listing
+                for bucket in self.s3.buckets.all():
+                    self.listing.add(bucket.name)
+            else:
+                # Get basic information about the path
+                path_parts = path.split('/')[1:]
+
+                # If create is not None, create the S3 data structures
+                if create is not None:
+                    self.isdir = create['isdir']
+                    self.listing = set()
+                    if self.isdir:
+                        if self.isbucket:
+                            self.bucket = self.s3.create_bucket(Bucket=path_parts[0])
+                            self.bucket.Versioning().enable()
+                            self.bucket.LifecycleConfiguration().put(
+                                LifecycleConfiguration={
+                                    'Rules': [
+                                        {
+                                            'ID': 'expire-old-versions',
+                                            'Prefix': '',
+                                            'Status': 'Enabled',
+                                            'NoncurrentVersionExpiration': {
+                                                'NoncurrentDays': 3
+                                            }
+                                        }
+                                    ]
+                                }
+                            )
+                        else:
+                            self.bucket = self.s3.Bucket(path_parts[0])
+                    else:
+                        # Upload an empty file to S3
+                        self.bucket = self.s3.Bucket(path_parts[0])
+                        self.bucket.upload_fileobj(
+                            Fileobj=io.BytesIO(b''),
+                            Key='/'.join(path_parts[1:]),
+                            ExtraArgs=dict(
+                                Metadata=dict(
+                                    s3fs=dict(
+                                        isdir=False,
+                                        dirty=False
+                                    )
+                                )
+                            )
+                        )
+                else: # Populate the stuff that would have been populated by create (bucket, isdir, listing)
+                    self.bucket = self.s3.Bucket(path_parts[0])
+                    effectivepath = '/'
+                    if not self.isbucket:
+                        effectivepath = _normpath('/'.join(path_parts[1:]))
+                    # We're a directory if there's a subfile or subdirectory or if we're a bucket
+                    self.isdir = self.isbucket or any([
+                        _normpath(obj.key).startswith(effectivepath) and
+                        _normpath(obj.key) != effectivepath
+                        for obj in self.bucket.objects.all()
+                    ])
+                    # If we're a directory, populate the listing
+                    if self.isdir:
+                        self.listing = set([
+                            _normpath(obj.key).split('/')[len(path_parts)]
+                            for obj in self.bucket.objects.all()
+                            if _normpath(obj.key).startswith(effectivepath) and
+                            _normpath(obj.key) != effectivepath
+                        ])
+                
+                # If we're a file, populate the file-specific stuff
+                if not self.isdir:
+                    self.obj = self.bucket.Object('/'.join(path_parts[1:]))
+                    self.dirty = False
+                    self._lock = Lock()
+                    versions = list(self.bucket.object_versions.filter(Prefix=self.obj.key).all())
+                    versions.sort(key=lambda x: x.last_modified)
+                    self.version = versions[-1]
+                    self.offsets = set()
+                
+                
+                # Ensure the parent directory exists
+                os.makedirs(os.path.dirname(os.path.join(self.cache_dir, _relnormpath(path))), exist_ok=True)
+                # If we're a file, open the file
+                if not self.isdir:
+                    self.fd = os.open(os.path.join(self.cache_dir, _relnormpath(path)), os.O_RDWR)
+                    self.file = os.fdopen(self.fd, 'br+')
+                    self.file.seek(0, os.SEEK_END)
+                    self.file.truncate(self.obj.content_length)
+                    self.file.flush()
+                    self.file.seek(0)
+                    # Chmod the file to 664 (rw-rw-r--) by default
+                    os.chmod(os.path.join(self.cache_dir, _relnormpath(path)), 0o664)
+                else:
+                    # Ensure the directory exists
+                    os.makedirs(os.path.join(self.cache_dir, _relnormpath(path)), exist_ok=True)
+                    # Chmod the directory to 775 (rwxrwxr-x) by default
+                    os.chmod(os.path.join(self.cache_dir, _relnormpath(path)), 0o775)
+                # Now chmod all parent directories to 775 (rwxrwxr-x) by default
+                for parent in range(len(path_parts) - 1):
+                    os.chmod(os.path.join(self.cache_dir, _relnormpath(os.path.join(*path_parts[:parent + 1]))), 0o775)
+        
+        @property
+        def isbucket(self):
+            '''
+            Whether or not this path is a bucket.
+            '''
+            return len(self.path.split('/')) == 2 and self.isdir
+        
+        @property
+        def isrootdir(self):
+            '''
+            Whether or not this path is the root directory.
+            '''
+            return len(self.path.split('/')) == 1 and self.isdir
+        
+        def getattr(self):
+            '''
+            Get the stat of the path.
+            '''
+            st = fuse.Stat()
+            st_cache = os.stat(os.path.join(self.cache_dir, _relnormpath(self.path)))
+            if self.isdir:
+                st.st_mode = stat.S_IFDIR | (st_cache.st_mode & 0o7777)
+                st.st_nlink = 2 + len(self.listing)
+            else:
+                st.st_mode = stat.S_IFREG | (st_cache.st_mode & 0o7777)
+                st.st_nlink = 1
+                st.st_size = self.obj.content_length
+            return st
+
+        def readdir(self, offset):
+            '''
+            Get the contents of the directory.
+            '''
+            if self.isdir:
+                yield fuse.Direntry('.')
+                yield fuse.Direntry('..')
+                for entry in self.listing:
+                    yield fuse.Direntry(entry)
+            else:
+                yield fuse.Direntry(os.path.basename(self.path))
+
+        def open(self, flags):
+            '''
+            Open the file.
+            '''
+            if self.isdir:
+                return -errno.EISDIR
+        
+        def read(self, size, offset):
+            '''
+            Read from the file.
+            '''
+            if self.isdir:
+                return -errno.EISDIR
+            if offset >= self.obj.content_length:
+                return b''
+            if offset + size > self.obj.content_length:
+                size = self.obj.content_length - offset
+            # Get sections of file that haven't been downloaded yet
+            sections = self._subtract_offsets({(offset, offset + size)}, self.offsets)
+            # Download sections of file that haven't been downloaded yet, and acquire the lock
+            with self._lock:
+                for section in sections:
+                    self.file.seek(section[0])
+                    self.file.write(self.obj.get(Range=f'''bytes={section[0]}-{section[1]}''', VersionId=self.version.id).get('Body').read())
+                self.file.flush()
+                self.file.seek(offset)
+                retval = self.file.read(size)
+            # Add downloaded sections to the list and remove contiguous sections from the list
+            self.offsets = self._add_offsets(self.offsets, {(offset, offset + size)})
+            # Return the data
+            return retval
+        
+        def write(self, buf, offset):
+            '''
+            Write to the file.
+            '''
+            if self.isdir:
+                return -errno.EISDIR
+            # Note that we need to read the entire file to write to it, because S3 doesn't support partial writes
+            self.read(self.obj.content_length, 0)
+            # Write to the file
+            with self._lock:
+                self.file.seek(offset)
+                self.file.write(buf)
+                self.file.flush()
+            # Mark the file as dirty
+            self.dirty = True
+            # Return the number of bytes written
+            return len(buf)
+
+        def flush(self):
+            '''
+            Flush the file (upload it to S3).
+            '''
+            if self.isdir:
+                return -errno.EISDIR
+            # If it's not dirty, return
+            if not self.dirty:
+                return
+            # Upload the file to S3
+            self.bucket.upload_fileobj(
+                Fileobj=self.file,
+                Key=self.obj.key,
+                ExtraArgs=dict(
+                    Metadata=dict(
+                        s3fs=dict(
+                            isdir=False,
+                            dirty=False
+                        )
+                    )
+                )
+            )
+            # Now, get the latest version of the object
+            versions = list(self.bucket.object_versions.filter(Prefix=self.obj.key))
+            versions.sort(key=lambda x: x.last_modified)
+            self.version = versions[-1]
+            # Update the version
+            self.versions[self.obj.key] = self.version.id
+            # Mark the file as not dirty
+            self.dirty = False
+
+    def premain(self):
         # Generate cache directory if it doesn't exist
         if not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir, exist_ok=True)
         
         # Parse config file
         config = configparser.ConfigParser()
-        with open(os.path.expanduser(self.config_path), 'r') as f:
+        with open(os.path.expanduser(self.config_file), 'r') as f:
             config.read_file(f)
         if config['default']['host_base'] != config['default']['host_bucket']:
             raise Exception('host_base and host_bucket must be the same')
@@ -105,184 +479,35 @@ class S3Fs(FuseApplication):
         self.s3 = boto3.resource(**client_args)
         self.s3.meta.client.meta.events.unregister('before-sign.s3', botocore.utils.fix_s3_host)
 
+        self.filesystem = dict()
+        self.filesystem['/'] = self.S3Path(self.s3, '/', self.cache_dir)
+
         # Load information about all buckets
         for bucket in self.s3.buckets.all():
-            # Only add buckets with versioning enabled
-            if bucket.Versioning().status != 'Enabled':
-                continue
-            self.buckets[bucket.name] = bucket
-        
-        # Load information about all objects
-        for bucket in self.buckets.values():
+            bucket_path = _normpath(bucket.name)
+            self.filesystem[bucket_path] = self.S3Path(self.s3, bucket_path, self.cache_dir)
             for obj in bucket.objects.all():
-                path = [bucket.name] + obj.key.split('/')
-                if path[-1] == '':
-                    path.pop()
-                cur_obj = self.objects
-                for path_part in path[:-1]:
-                    if path_part not in cur_obj or not isinstance(cur_obj[path_part], dict):
-                        cur_obj[path_part] = dict()
-                    cur_obj = cur_obj[path_part]
-                cur_obj[path[-1]] = obj
-
-        # Save versions and initialize offsets
-        for bucket in self.buckets.values():
-            for obj in bucket.objects.all():
-                path = [bucket.name] + obj.key.split('/')
-                if path[-1] == '':
-                    path.pop()
-                if path[1] == '':
-                    path.pop(1)
-                self.offsets['/'.join(path)] = set()
-                latest_version_time = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-                for version in bucket.object_versions.filter(Prefix=obj.key):
-                    if version.last_modified > latest_version_time and version.last_modified < self.timestamp:
-                        latest_version_time = version.last_modified
-                        self.versions['/'.join(path)] = version.id
-
-    def getattr(self, path):
-        # Split path into a list of parts
-        path_parts = path.split('/')
-        if path_parts[-1] == '':
-            path_parts.pop()
-        path_parts.pop(0)
-        # Return based on the path
-        cur_obj = self.objects
-        for path_part in path_parts:
-            if path_part not in cur_obj:
-                return -errno.ENOENT
-            cur_obj = cur_obj[path_part]
-        st = fuse.Stat()
-        # If it's a directory, return a directory
-        if isinstance(cur_obj, dict):
-            st.st_mode = stat.S_IFDIR | 0o755
-            st.st_nlink = 2 + len(cur_obj)
-            return st
-        # If it's an object, return a file
-        st.st_mode = stat.S_IFREG | 0o444
-        st.st_nlink = 1
-        st.st_size = cur_obj.size
-        return st
-
-    def readdir(self, path, offset):
-        # Split path into a list of parts
-        path_parts = path.split('/')
-        if path_parts[-1] == '':
-            path_parts.pop()
-        path_parts.pop(0)
-        # Return based on the path
-        cur_obj = self.objects
-        for path_part in path_parts:
-            if path_part not in cur_obj:
-                return -errno.ENOENT
-            cur_obj = cur_obj[path_part]
-        # If it's a directory, return a directory
-        if isinstance(cur_obj, dict):
-            yield fuse.Direntry('.')
-            yield fuse.Direntry('..')
-            for obj_name in cur_obj.keys():
-                yield fuse.Direntry(obj_name)
-            return
-        # If it's an object, return a file
-        yield fuse.Direntry(cur_obj.key.split('/')[-1])
-
-    def open(self, path, flags):
-        # Split path into a list of parts
-        path_parts = path.split('/')
-        if path_parts[-1] == '':
-            path_parts.pop()
-        path_parts.pop(0)
-        # Return based on the path
-        cur_obj = self.objects
-        for path_part in path_parts:
-            if path_part not in cur_obj:
-                return -errno.ENOENT
-            cur_obj = cur_obj[path_part]
-        # If it's a directory, return EISDIR
-        if isinstance(cur_obj, dict):
-            return -errno.EISDIR
-        # If it's an object, return a file and check permissions
-        accmode = os.O_RDONLY | os.O_WRONLY | os.O_RDWR
-        if (flags & accmode) != os.O_RDONLY:
-            return -errno.EACCES
-
-    def read(self, path, size, offset):
-        # Split path into a list of parts
-        path_parts = path.split('/')
-        if path_parts[-1] == '':
-            path_parts.pop()
-        path_parts.pop(0)
-        path_rel = '/'.join(path_parts)
-        # Return based on the path
-        cur_obj = self.objects
-        for path_part in path_parts:
-            if path_part not in cur_obj:
-                return -errno.ENOENT
-            cur_obj = cur_obj[path_part]
-        # If it's a directory, return EISDIR
-        if isinstance(cur_obj, dict):
-            return -errno.EISDIR
-        # If it's an object, return a file
-        if offset >= cur_obj.size:
-            return b''
-        if offset + size > cur_obj.size:
-            size = cur_obj.size - offset
-        # Get sections of file that haven't been downloaded yet
-        sections = [(offset, offset + size)]
-        retry = True
-        while retry:
-            retry = False
-            for section_have in self.offsets[path_rel]:
-                for i in range(len(sections)):
-                    section_want = sections[i]
-                    # If the section is already downloaded, remove it from the list
-                    if section_have[0] >= section_want[0] and section_have[1] <= section_want[1]:
-                        sections.pop(i)
-                        retry = True
-                        break
-                    # If the section is partially downloaded from the start, truncate it
-                    if section_have[0] >= section_want[0] and section_have[0] < section_want[1]:
-                        sections[i] = (section_have[1], section_want[1])
-                        retry = True
-                        break
-                    # If the section is partially downloaded from the end, truncate it
-                    if section_have[1] > section_want[0] and section_have[1] <= section_want[1]:
-                        sections[i] = (section_want[0], section_have[0])
-                        retry = True
-                        break
-                    # If the section is partially downloaded from the middle, split it
-                    if section_have[0] > section_want[0] and section_have[1] < section_want[1]:
-                        sections[i] = (section_want[0], section_have[0])
-                        sections.insert(i + 1, (section_have[1], section_want[1]))
-                        retry = True
-                        break
-                if retry:
-                    break
-        # Create file and directories if it doesn't exist
-        if not os.path.exists(os.path.join(self.cache_dir, path_rel)):
-            os.makedirs(os.path.dirname(os.path.join(self.cache_dir, path_rel)), exist_ok=True)
-            with open(os.path.join(self.cache_dir, path_rel), 'bw') as f:
-                f.truncate(cur_obj.size)
-        # Download sections of file that haven't been downloaded yet
-        with open(os.path.join(self.cache_dir, path_rel), 'br+') as f:
-            for section in sections:
-                f.seek(section[0])
-                f.write(cur_obj.get(Range=f'''bytes={section[0]}-{section[1]}''', VersionId=self.versions[path_rel]).get('Body').read())
-            f.flush()
-
-            f.seek(offset)
-            retval = f.read(size)
+                obj_path = _normpath(os.path.join(bucket_path, _relnormpath(obj.key)))
+                self.filesystem[obj_path] = self.S3Path(self.s3, obj_path, self.cache_dir)
         
-        # Add downloaded sections to the list
-        for section in sections:
-            self.offsets[path_rel].add(section)
-        # Remove contiguous sections from the list
-        for i in range(len(self.offsets[path_rel])):
-            for j in range(i + 1, len(self.offsets[path_rel])):
-                if self.offsets[path_rel][i][1] == self.offsets[path_rel][j][0]:
-                    self.offsets[path_rel][i] = (self.offsets[path_rel][i][0], self.offsets[path_rel][j][1])
-                    self.offsets[path_rel].pop(j)
-                    break
-        
-        return retval
-
+    def __getattr__(self, meth):
+        if meth not in self._attrs or not hasattr(self.S3Path, meth):
+            return super().__getattr__(meth)
+        enoent = meth in {'getattr', 'readdir', 'open', 'read', 'write', 'flush'}
+        eexist = meth in {'mkdir'}
+        isdir = meth in {'mkdir', 'readdir'}
+        def func(path, *args, **kwargs):
+            path = _normpath(path)
+            exists = path in self.filesystem
+            if not exists:
+                if enoent:
+                    return -errno.ENOENT
+                else:
+                    self.filesystem[path] = self.S3Path(self.s3, path, self.cache_dir, create={
+                        'isdir': isdir,
+                    })
+            elif eexist:
+                return -errno.EEXIST
+            #print(f'''{meth}({path}, {args}, {kwargs})''')
+            return getattr(self.filesystem[path], meth)(*args, **kwargs)
+        return func
