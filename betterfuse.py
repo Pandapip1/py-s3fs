@@ -90,3 +90,10 @@ class FuseApplication(fuse.Fuse):
 
         # Call the superclass's main method
         super().main(*args, **kwargs)
+    
+    @abstractmethod
+    def premain(self):
+        '''
+        Called before the filesystem is attached.
+        '''
+        pass
