@@ -283,7 +283,7 @@ class S3Fs(FuseApplication):
                 os.makedirs(os.path.dirname(os.path.join(self.cache_dir, _relnormpath(path))), exist_ok=True)
                 # If we're a file, open the file
                 if not self.isdir:
-                    self.fd = os.open(os.path.join(self.cache_dir, _relnormpath(path)), os.O_RDWR)
+                    self.fd = os.open(os.path.join(self.cache_dir, _relnormpath(path)), os.O_RDWR | os.O_CREAT)
                     self.file = os.fdopen(self.fd, 'br+')
                     self.file.seek(0, os.SEEK_END)
                     self.file.truncate(self.obj.content_length)
