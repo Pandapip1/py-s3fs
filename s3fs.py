@@ -1,5 +1,5 @@
 from betterfuse import FuseApplication, FuseOption
-import os, stat, errno, inspect, datetime, boto3, botocore, configparser, fuse, io, types
+import os, stat, errno, inspect, datetime, boto3, botocore, configparser, fuse, io, types, struct
 from mypy_boto3_s3.service_resource import S3ServiceResource, Bucket, Object, ObjectVersion
 from threading import Lock
 
@@ -328,6 +328,40 @@ class S3Fs(FuseApplication):
                 st.st_nlink = 1
                 st.st_size = self.obj.content_length
             return st
+        
+        def getxattr(self, name, size):
+            # Fetch the xattr from the cache file
+            retval = os.getxattr(os.path.join(self.cache_dir, _relnormpath(self.path)), name)
+            # If the size is 0, return the size of the xattr
+            if size == 0:
+                return len(retval)
+            # Otherwise, return the xattr
+            return retval
+        
+        def listxattr(self, size):
+            # Fetch the xattrs from the cache file
+            retval = os.listxattr(os.path.join(self.cache_dir, _relnormpath(self.path)))
+            # If the size is 0, return the size of the xattrs (joint size, including null terminators)
+            if size == 0:
+                return sum([len(xattr) + 1 for xattr in retval])
+            # Otherwise, return the xattrs
+            return retval
+        
+        def setxattr(self, name, value, flags):
+            # Set the xattr on the cache file
+            os.setxattr(os.path.join(self.cache_dir, _relnormpath(self.path)), name, value, flags)
+        
+        def removexattr(self, name):
+            # Remove the xattr from the cache file
+            os.removexattr(os.path.join(self.cache_dir, _relnormpath(self.path)), name)
+
+        def fgetattr(self):
+            '''
+            Get the stat of the file.
+            '''
+            if self.isdir:
+                return -errno.EISDIR
+            return self.getattr()
 
         def readdir(self, offset):
             '''
@@ -348,6 +382,31 @@ class S3Fs(FuseApplication):
             if self.isdir:
                 return -errno.EISDIR
         
+        def lock(self, cmd, owner, **kargs):
+            '''
+            Lock the file. Not cross-platform compatible (Linux only, due to F_GETLK)
+            '''
+            fnctl = fuse.fnctl # Alias
+            op = {
+                fcntl.F_UNLCK : fcntl.LOCK_UN,
+                fcntl.F_RDLCK : fcntl.LOCK_SH,
+                fcntl.F_WRLCK : fcntl.LOCK_EX
+            }[kargs['l_type']]
+            if cmd == fuse.fnctl.F_GETLK:
+                lockdata = struct.pack('hhQQi', kargs['l_type'], os.SEEK_SET, kargs['l_start'], kargs['l_len'], kargs['l_pid'])
+                ld2 = fcntl.fcntl(self.fd, fcntl.F_GETLK, lockdata)
+                flockfields = ('l_type', 'l_whence', 'l_start', 'l_len', 'l_pid')
+                uld2 = struct.unpack('hhQQi', ld2)
+                res = dict(zip(flockfields, uld2))
+                return fuse.Flock(**res)
+            elif cmd == fuse.fnctl.F_SETLK:
+                if op != fcntl.LOCK_UN:
+                    op |= fcntl.LOCK_NB
+                fcntl.flock(self.fd, op)
+            elif cmd == fnctl.F_SETLKW:
+                pass # TODO: Implement blocking locks
+            return -fuse.EINVAL
+
         def read(self, size, offset):
             '''
             Read from the file.
@@ -421,6 +480,26 @@ class S3Fs(FuseApplication):
             self.versions[self.obj.key] = self.version.id
             # Mark the file as not dirty
             self.dirty = False
+        
+        def release(self, flags):
+            '''
+            Release the file.
+            '''
+            if self.isdir:
+                return -errno.EISDIR
+            # Flush if we haven't already
+            self.flush()
+        
+        def ftruncate(self, size):
+            '''
+            Truncate the file.
+            '''
+            if self.isdir:
+                return -errno.EISDIR
+            # Truncate the file
+            self.file.truncate(size)
+            # Mark the file as dirty
+            self.dirty = True
 
     def premain(self):
         # Generate cache directory if it doesn't exist
@@ -489,25 +568,124 @@ class S3Fs(FuseApplication):
             for obj in bucket.objects.all():
                 obj_path = _normpath(os.path.join(bucket_path, _relnormpath(obj.key)))
                 self.filesystem[obj_path] = self.S3Path(self.s3, obj_path, self.cache_dir)
+    
+    def __getattribute__(self, attr):
+        super_getattribute = super().__getattribute__  # Cache super method for reuse
         
-    def __getattr__(self, meth):
-        if meth not in self._attrs or not hasattr(self.S3Path, meth):
-            return super().__getattr__(meth)
-        enoent = meth in {'getattr', 'readdir', 'open', 'read', 'write', 'flush'}
-        eexist = meth in {'mkdir'}
-        isdir = meth in {'mkdir', 'readdir'}
-        def func(path, *args, **kwargs):
-            path = _normpath(path)
-            exists = path in self.filesystem
-            if not exists:
-                if enoent:
-                    return -errno.ENOENT
-                else:
-                    self.filesystem[path] = self.S3Path(self.s3, path, self.cache_dir, create={
-                        'isdir': isdir,
-                    })
-            elif eexist:
-                return -errno.EEXIST
-            #print(f'''{meth}({path}, {args}, {kwargs})''')
-            return getattr(self.filesystem[path], meth)(*args, **kwargs)
-        return func
+        try:
+            attrval = super_getattribute(attr)  # Try to get attribute value
+        except AttributeError:
+            # See if the attribute exists in the S3Path class
+            if attr not in super_getattribute('_attrs') or not hasattr(super_getattribute('S3Path'), attr):
+                raise  # Re-raise the AttributeError if not handled
+            def func(path, *args, **kwargs):
+                # Define a function to handle attribute access on non-existing attributes
+                path = _normpath(path)
+                filesystem = super_getattribute('filesystem')
+                if path not in filesystem:
+                    return -errno.ENOENT  # Return error if path doesn't exist
+                return getattr(filesystem[path], attr)(*args, **kwargs)  # Get attribute from filesystem
+            attrval = func  # Set attrval to func for wrapping below
+        
+        # Debug wrapper for method calls if debug is enabled
+        if super_getattribute('debug') and isinstance(attrval, types.MethodType) and attr in super_getattribute('_attrs'):
+            def wrapper(*args, **kwargs):
+                # Wrap the method call with debug print
+                arg_reprs = [repr(arg) for arg in args] + [f'{key}={repr(value)}' for key, value in kwargs.items()]
+                print(f'{attr}({", ".join(arg_reprs)})')
+                return attrval(*args, **kwargs)
+            return wrapper
+        
+        return attrval  # Return the attribute value or wrapped method
+
+    def create(self, path, mode, fi=None):
+        '''
+        Create a file.
+        '''
+        path = _normpath(path)
+        exists = path in self.filesystem
+        if exists:
+            return -errno.EEXIST
+        self.filesystem[path] = self.S3Path(self.s3, path, self.cache_dir, create={
+            'isdir': False,
+        })
+    
+    def mkdir(self, path, mode):
+        '''
+        Create a directory.
+        '''
+        path = _normpath(path)
+        exists = path in self.filesystem
+        if exists:
+            return -errno.EEXIST
+        self.filesystem[path] = self.S3Path(self.s3, path, self.cache_dir, create={
+            'isdir': True,
+        })
+    
+    def link(self, target, source):
+        '''
+        Create a hard link.
+
+        (Due to how S3 works, this is implemented as a copy)
+        '''
+        target = _normpath(target)
+        source = _normpath(source)
+        exists_target = target in self.filesystem
+        exists_source = source in self.filesystem
+        if not exists_source:
+            return -errno.ENOENT
+        if exists_target:
+            return -errno.EEXIST
+        # Copy the file
+        self.filesystem[target] = self.S3Path(self.s3, target, self.cache_dir, create={
+            'isdir': self.filesystem[source].isdir,
+        })
+        self.filesystem[target].file.write(self.filesystem[source].file.read())
+        self.filesystem[target].file.flush()
+    
+    def unlink(self, path):
+        '''
+        Delete a file.
+        '''
+        path = _normpath(path)
+        exists = path in self.filesystem
+        if not exists:
+            return -errno.ENOENT
+        if self.filesystem[path].isdir:
+            return -errno.EISDIR
+        self.filesystem[path].obj.delete() # Delete the object from S3
+        del self.filesystem[path]
+    
+    def rmdir(self, path):
+        '''
+        Delete a directory.
+        '''
+        path = _normpath(path)
+        exists = path in self.filesystem
+        if not exists:
+            return -errno.ENOENT
+        if not self.filesystem[path].isdir:
+            return -errno.ENOTDIR
+        del self.filesystem[path]
+    
+    def rename(self, old, new):
+        '''
+        Rename a file or directory.
+        '''
+        # Implemented hackily: copy the file, then delete the old file
+        old = _normpath(old)
+        new = _normpath(new)
+        exists_old = old in self.filesystem
+        exists_new = new in self.filesystem
+        if not exists_old:
+            return -errno.ENOENT
+        if exists_new:
+            return -errno.EEXIST
+        # Copy the file
+        self.filesystem[new] = self.S3Path(self.s3, new, self.cache_dir, create={
+            'isdir': self.filesystem[old].isdir,
+        })
+        self.filesystem[new].file.write(self.filesystem[old].file.read())
+        self.filesystem[new].file.flush()
+        # Delete the old file
+        self.unlink(old)

@@ -61,6 +61,11 @@ class FuseApplication(fuse.Fuse):
     A subclass of fuse.Fuse that uses the class's attributes to add options to the command line, and automatically parses it.
     '''
 
+    debug = None
+    '''
+    Whether debug mode is enabled. None if not determined.
+    '''
+
     def __init__(self, **kwargs):
         # Set required attributes
         super().__init__(
@@ -81,6 +86,16 @@ class FuseApplication(fuse.Fuse):
     
     def main(self, *args, **kwargs):
         self.parse(errex=1)
+
+        # If debug is enabled, set the parameter
+        if self.debug is None:
+            self.debug = 'debug' in self.fuse_args.optlist
+        elif self.debug:
+            # Okay then, we're doing it their way I guess.
+            self.fuse_args.optlist.add('debug')
+        
+        if self.debug:
+            print('Debug mode enabled.')
 
         if self.fuse_args.mountpoint is None and not self.fuse_args.modifiers['showhelp'] and not self.fuse_args.modifiers['showversion']:
             self.fuse_args.modifiers['showhelp'] = True
